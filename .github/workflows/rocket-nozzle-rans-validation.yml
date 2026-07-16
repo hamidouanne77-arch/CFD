@@ -1,0 +1,174 @@
+name: Rocket nozzle RANS validation
+
+on:
+  push:
+    branches: [rocket-nozzle-rans-validation]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-su2:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ninja-build python3 python3-pip git ccache
+      - name: Clone and build SU2 8.5.0
+        run: |
+          git clone --recursive --depth 1 --branch v8.5.0 https://github.com/su2code/SU2.git SU2
+          cd SU2
+          ./meson.py setup build --prefix="$GITHUB_WORKSPACE/su2-install" \
+            -Dwith-mpi=disabled -Dwith-omp=true -Denable-autodiff=false \
+            -Denable-directdiff=false -Denable-tecio=false -Denable-cgns=false \
+            -Dcpu-arch=x86-64
+          ./ninja -C build install -j2
+          "$GITHUB_WORKSPACE/su2-install/bin/SU2_CFD" --version | tee "$GITHUB_WORKSPACE/su2-version.txt" || true
+      - name: Package SU2 installation
+        run: tar -C "$GITHUB_WORKSPACE" -czf su2-install.tar.gz su2-install
+      - uses: actions/upload-artifact@v4
+        with:
+          name: su2-8.5.0-linux
+          path: |
+            su2-install.tar.gz
+            su2-version.txt
+          retention-days: 14
+
+  official-axisymmetric-nozzle:
+    needs: build-su2
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: su2-8.5.0-linux
+      - name: Restore SU2
+        run: |
+          tar -xzf su2-install.tar.gz
+          echo "$GITHUB_WORKSPACE/su2-install/bin" >> "$GITHUB_PATH"
+      - name: Sparse checkout official SU2 RANS air nozzle
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/su2code/TestCases.git SU2-TestCases
+          cd SU2-TestCases
+          git sparse-checkout init --cone
+          git sparse-checkout set axisymmetric_rans/air_nozzle
+          git checkout master
+      - name: Execute official axisymmetric SST nozzle case
+        run: |
+          set +e
+          cd SU2-TestCases/axisymmetric_rans/air_nozzle
+          /usr/bin/time -v "$GITHUB_WORKSPACE/su2-install/bin/SU2_CFD" air_nozzle_restart.cfg > run.log 2>&1
+          code=$?
+          echo "$code" > exit_code.txt
+          tail -120 run.log || true
+          exit 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: official-axisymmetric-sst-nozzle
+          path: SU2-TestCases/axisymmetric_rans/air_nozzle
+          retention-days: 14
+
+  nasa-hump-rans:
+    needs: build-su2
+    strategy:
+      fail-fast: false
+      matrix:
+        grid: [103x28, 205x55, 409x109]
+        model: [SA, SST]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: su2-8.5.0-linux
+      - name: Restore SU2 and Python dependencies
+        run: |
+          tar -xzf su2-install.tar.gz
+          echo "$GITHUB_WORKSPACE/su2-install/bin" >> "$GITHUB_PATH"
+          python3 -m pip install --user --break-system-packages numpy pandas matplotlib
+      - name: Download NASA/TMBWG benchmark assets
+        run: |
+          mkdir -p assets
+          wget -q --tries=5 https://www.nasa.gov/wp-content/uploads/2026/02/nasahump-grids.zip -O assets/Nasahump_grids.zip
+          unzip -q assets/Nasahump_grids.zip -d assets/grids
+          wget -q --tries=5 https://tmbwg.github.io/turbmodels/Nasahump_validation/noflow_cp.exp.dat -O assets/noflow_cp.exp.dat
+          wget -q --tries=5 https://tmbwg.github.io/turbmodels/Nasahump_validation/noflow_cf.exp.dat -O assets/noflow_cf.exp.dat
+          find assets -maxdepth 4 -type f | sort | tee assets/files.txt
+      - name: Prepare mesh and RANS configuration
+        run: |
+          mkdir -p case_${{ matrix.model }}_${{ matrix.grid }}
+          src=$(find assets/grids -type f -name "*noplenumZ${{ matrix.grid }}.p2dfmt.gz" | head -1)
+          test -n "$src"
+          python3 rocket_nozzle_validation/convert_hump_plot3d_to_su2.py "$src" case_${{ matrix.model }}_${{ matrix.grid }}/hump.su2 --scale 0.42
+          iterations=12000
+          cfl=50
+          if [ "${{ matrix.grid }}" = "409x109" ]; then iterations=18000; cfl=20; fi
+          python3 rocket_nozzle_validation/make_hump_configs.py \
+            --mesh hump.su2 --model ${{ matrix.model }} --iterations "$iterations" --cfl "$cfl" \
+            --output case_${{ matrix.model }}_${{ matrix.grid }}/case.cfg
+          cp assets/noflow_*.exp.dat case_${{ matrix.model }}_${{ matrix.grid }}/
+      - name: Execute SU2 RANS
+        run: |
+          set +e
+          cd case_${{ matrix.model }}_${{ matrix.grid }}
+          /usr/bin/time -v "$GITHUB_WORKSPACE/su2-install/bin/SU2_CFD" case.cfg > run.log 2>&1
+          code=$?
+          echo "$code" > exit_code.txt
+          tail -150 run.log || true
+          exit 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hump-${{ matrix.model }}-${{ matrix.grid }}
+          path: case_${{ matrix.model }}_${{ matrix.grid }}
+          retention-days: 14
+
+  postprocess:
+    if: always()
+    needs: nasa-hump-rans
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: hump-*
+          path: downloaded-cases
+      - name: Gather case directories
+        run: |
+          find downloaded-cases -maxdepth 3 -type f | head -100
+          mkdir -p cases
+          for d in downloaded-cases/hump-*; do
+            [ -d "$d" ] || continue
+            name=$(basename "$d" | sed 's/^hump-//')
+            cp -a "$d" "cases/$name"
+          done
+          first=$(find cases -type f -name noflow_cp.exp.dat | head -1)
+          test -n "$first"
+          cp "$first" noflow_cp.exp.dat
+          firstcf=$(find cases -type f -name noflow_cf.exp.dat | head -1)
+          cp "$firstcf" noflow_cf.exp.dat
+      - name: Install post-processing dependencies
+        run: python3 -m pip install --user --break-system-packages numpy pandas matplotlib
+      - name: Post-process validation
+        run: |
+          set +e
+          python3 rocket_nozzle_validation/postprocess_hump.py \
+            --root cases --cp-exp noflow_cp.exp.dat --cf-exp noflow_cf.exp.dat --output validation-results \
+            > postprocess.log 2>&1
+          code=$?
+          echo "$code" > postprocess_exit_code.txt
+          cat postprocess.log
+          exit 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nasa-hump-rans-validation-results
+          path: |
+            validation-results
+            postprocess.log
+            postprocess_exit_code.txt
+          retention-days: 14
