@@ -3,6 +3,8 @@ name: Rocket nozzle RANS validation
 on:
   push:
     branches: [rocket-nozzle-rans-validation]
+  pull_request:
+    branches: [master]
   workflow_dispatch:
 
 permissions:
@@ -26,7 +28,7 @@ jobs:
             -Dwith-mpi=disabled -Dwith-omp=true -Denable-autodiff=false \
             -Denable-directdiff=false -Denable-tecio=false -Denable-cgns=false \
             -Dcpu-arch=x86-64
-          ./ninja -C build install -j2
+          ./ninja -C build -j2 install
           "$GITHUB_WORKSPACE/su2-install/bin/SU2_CFD" --version | tee "$GITHUB_WORKSPACE/su2-version.txt" || true
       - name: Package SU2 installation
         run: tar -C "$GITHUB_WORKSPACE" -czf su2-install.tar.gz su2-install
