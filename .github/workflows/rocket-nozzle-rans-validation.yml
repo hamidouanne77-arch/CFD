@@ -21,24 +21,45 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential ninja-build python3 python3-pip git ccache
       - name: Clone and build SU2 8.5.0
+        id: compile
+        continue-on-error: true
         run: |
-          git clone --recursive --depth 1 --branch v8.5.0 https://github.com/su2code/SU2.git SU2
-          cd SU2
-          ./meson.py setup build --prefix="$GITHUB_WORKSPACE/su2-install" \
-            -Dwith-mpi=disabled -Dwith-omp=true -Denable-autodiff=false \
-            -Denable-directdiff=false -Denable-tecio=false -Denable-cgns=false \
-            -Dcpu-arch=x86-64
-          ./ninja -C build -j2 install
-          "$GITHUB_WORKSPACE/su2-install/bin/SU2_CFD" --version | tee "$GITHUB_WORKSPACE/su2-version.txt" || true
-      - name: Package SU2 installation
-        run: tar -C "$GITHUB_WORKSPACE" -czf su2-install.tar.gz su2-install
+          set -o pipefail
+          {
+            git clone --recursive --depth 1 --branch v8.5.0 https://github.com/su2code/SU2.git SU2
+            cd SU2
+            ./meson.py setup build --prefix="$GITHUB_WORKSPACE/su2-install" \
+              -Dwith-mpi=disabled -Dwith-omp=true -Denable-autodiff=false \
+              -Denable-directdiff=false -Denable-tecio=false -Denable-cgns=false \
+              -Dcpu-arch=x86-64
+            ./ninja -C build -j2 install
+            "$GITHUB_WORKSPACE/su2-install/bin/SU2_CFD" --version || true
+          } 2>&1 | tee "$GITHUB_WORKSPACE/su2-build.log"
+          code=${PIPESTATUS[0]}
+          echo "$code" > "$GITHUB_WORKSPACE/su2-build-exit-code.txt"
+          exit "$code"
+      - name: Package SU2 installation when present
+        if: always()
+        run: |
+          if [ -d "$GITHUB_WORKSPACE/su2-install" ]; then
+            tar -C "$GITHUB_WORKSPACE" -czf su2-install.tar.gz su2-install
+          else
+            touch su2-install-missing.txt
+          fi
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: su2-8.5.0-linux
           path: |
             su2-install.tar.gz
-            su2-version.txt
+            su2-install-missing.txt
+            su2-build.log
+            su2-build-exit-code.txt
+          if-no-files-found: warn
           retention-days: 14
+      - name: Enforce successful solver build
+        if: always()
+        run: test -x "$GITHUB_WORKSPACE/su2-install/bin/SU2_CFD"
 
   official-axisymmetric-nozzle:
     needs: build-su2
