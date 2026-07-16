@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Convert formatted 2-D multi-grid PLOT3D NASA hump grids to SU2.
 
-The TMR files contain one block, with i varying fastest.  The first j-line is
-NASA hump wall, the last j-line is the contoured inviscid upper boundary.
+The TMR files contain one block, with i varying fastest. The first j-line is
+the NASA hump wall; the last j-line is the contoured inviscid upper boundary.
+Coordinates may be scaled to the physical hump chord (0.4200 m).
 """
 from __future__ import annotations
 
@@ -79,10 +80,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--scale", type=float, default=1.0)
     args = parser.parse_args()
+    if not np.isfinite(args.scale) or args.scale <= 0.0:
+        raise ValueError("--scale must be positive and finite")
     x, y = read_plot3d(args.input)
+    x = x * args.scale
+    y = y * args.scale
     write_su2(x, y, args.output)
-    print(f"converted {x.shape[1]}x{x.shape[0]} -> {args.output}")
+    print(f"converted {x.shape[1]}x{x.shape[0]} at scale={args.scale} -> {args.output}")
 
 
 if __name__ == "__main__":
