@@ -1,0 +1,122 @@
+name: R0-32F SU2 real solver
+
+on:
+  push:
+    branches: [r0-32f-su2-real-run]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  su2-rans-validation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout campaign repository
+        uses: actions/checkout@v4
+
+      - name: Install runtime tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip git jq python3 python3-pip
+          python3 -m pip install --break-system-packages matplotlib
+
+      - name: Download official SU2 8.5.0 OpenMP binary
+        run: |
+          set -euxo pipefail
+          mkdir -p $GITHUB_WORKSPACE/solver
+          ASSET_URL=$(curl -fsSL https://api.github.com/repos/su2code/SU2/releases/tags/v8.5.0 | jq -r '.assets[] | select(.name | test("linux64-omp\\.zip$")) | .browser_download_url' | head -1)
+          test -n "$ASSET_URL"
+          echo "$ASSET_URL" > solver/official_asset_url.txt
+          curl -fL --retry 5 --retry-delay 5 "$ASSET_URL" -o solver/SU2-v8.5.0-linux64-omp.zip
+          sha256sum solver/SU2-v8.5.0-linux64-omp.zip | tee solver/SU2_BINARY_SHA256.txt
+          unzip -q solver/SU2-v8.5.0-linux64-omp.zip -d solver/unpacked
+          SU2_CFD_PATH=$(find solver/unpacked -type f -name SU2_CFD | head -1)
+          test -x "$SU2_CFD_PATH"
+          dirname "$SU2_CFD_PATH" > solver/SU2_RUN_PATH.txt
+          "$SU2_CFD_PATH" --help > solver/SU2_CFD_HELP.txt 2>&1 || true
+          ldd "$SU2_CFD_PATH" > solver/SU2_CFD_LDD.txt || true
+
+      - name: Fetch official SU2 test cases
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch v8.5.0 https://github.com/su2code/SU2.git official_SU2
+          mkdir -p runs/SA runs/SST
+          cp official_SU2/TestCases/rans/naca0012/n0012_225-65.su2 runs/SA/
+          cp official_SU2/TestCases/rans/naca0012/n0012_225-65.su2 runs/SST/
+          cp official_SU2/TestCases/rans/naca0012/turb_NACA0012_sa.cfg runs/SA/case.cfg
+          cp official_SU2/TestCases/rans/naca0012/turb_NACA0012_sst_2003m.cfg runs/SST/case.cfg
+          for d in SA SST; do
+            sed -i 's/^RESTART_SOL=.*/RESTART_SOL= NO/' runs/$d/case.cfg
+            sed -i 's/^ITER=.*/ITER= 4000/' runs/$d/case.cfg
+            sed -i 's/^OUTPUT_WRT_FREQ=.*/OUTPUT_WRT_FREQ= 500/' runs/$d/case.cfg
+            cat >> runs/$d/case.cfg <<'EOF'
+OUTPUT_FILES= (RESTART, PARAVIEW, SURFACE_PARAVIEW, CSV)
+HISTORY_OUTPUT= (ITER, RMS_RES, LIFT, DRAG, MOMENT_Z, CFL_NUMBER)
+VOLUME_OUTPUT= (COORDINATES, SOLUTION, PRIMITIVE, PRESSURE_COEFF, MACH, VORTEX_IDENTIFICATION, EDDY_VISCOSITY)
+EOF
+          done
+
+      - name: Execute official SU2_CFD SA and SST
+        run: |
+          set -euxo pipefail
+          SU2_RUN=$(cat solver/SU2_RUN_PATH.txt)
+          export PATH="$GITHUB_WORKSPACE/$SU2_RUN:$PATH"
+          export OMP_NUM_THREADS=2
+          SU2_CFD --version | tee solver/SU2_VERSION.txt || true
+          for d in SA SST; do
+            cd "$GITHUB_WORKSPACE/runs/$d"
+            /usr/bin/time -v SU2_CFD case.cfg > solver.log 2>&1
+            cp history.csv history_full.csv
+            tail -n 250 history.csv > history_tail.csv
+          done
+
+      - name: Build numerical summary and validation figures
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import csv, json
+          import matplotlib.pyplot as plt
+          root=Path('runs')
+          out={}
+          for model in ['SA','SST']:
+              p=root/model/'history.csv'
+              with p.open() as f:
+                  rows=list(csv.DictReader(f))
+              last=rows[-1]
+              def pick(*names):
+                  for n in names:
+                      if n in last:
+                          return float(last[n])
+                  return None
+              out[model]={
+                  'iterations':len(rows),
+                  'CL':pick('CL','LIFT'),
+                  'CD':pick('CD','DRAG'),
+                  'CMz':pick('CMz','MOMENT_Z'),
+                  'rms_density':pick('rms[Rho]','RMS_DENSITY'),
+                  'history_columns':list(last.keys()),
+              }
+              x=[]; cl=[]; cd=[]
+              for i,r in enumerate(rows):
+                  x.append(i)
+                  cl.append(float(r.get('CL',r.get('LIFT','nan'))))
+                  cd.append(float(r.get('CD',r.get('DRAG','nan'))))
+              plt.figure(figsize=(10,6)); plt.plot(x,cl,label='CL'); plt.plot(x,cd,label='CD'); plt.grid(True); plt.legend(); plt.xlabel('Iteration'); plt.title(f'SU2 RANS {model} coefficient history'); plt.tight_layout(); plt.savefig(root/model/f'{model}_coeff_history.png',dpi=180); plt.close()
+          if all(out[m]['CL'] is not None for m in out):
+              out['cross_model']={
+                  'CL_difference_percent':100*abs(out['SA']['CL']-out['SST']['CL'])/max(abs(out['SST']['CL']),1e-12),
+                  'CD_difference_percent':100*abs(out['SA']['CD']-out['SST']['CD'])/max(abs(out['SST']['CD']),1e-12),
+              }
+          Path('R0_32F_SU2_VALIDATION_SUMMARY.json').write_text(json.dumps(out,indent=2))
+          PY
+
+      - name: Archive solver-native results
+        uses: actions/upload-artifact@v4
+        with:
+          name: R0-32F-SU2-RANS-SA-SST-results
+          path: |
+            solver/
+            runs/
+            R0_32F_SU2_VALIDATION_SUMMARY.json
+          retention-days: 30
