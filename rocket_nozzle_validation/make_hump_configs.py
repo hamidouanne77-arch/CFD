@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import math
+from pathlib import Path
+
+GAMMA = 1.4
+R_AIR = 287.058
+MACH = 0.1
+T_STATIC = 300.0
+P_STATIC = 101325.0
+RE_C = 936000.0
+CHORD_M = 0.4200
+
+
+def config(mesh_name: str, model: str, iterations: int, cfl: float) -> str:
+    a = math.sqrt(GAMMA * R_AIR * T_STATIC)
+    u = MACH * a
+    rho = P_STATIC / (R_AIR * T_STATIC)
+    mu = rho * u * CHORD_M / RE_C
+    t0 = T_STATIC * (1.0 + 0.5 * (GAMMA - 1.0) * MACH**2)
+    p0 = P_STATIC * (1.0 + 0.5 * (GAMMA - 1.0) * MACH**2) ** (GAMMA/(GAMMA - 1.0))
+
+    turb = "SA" if model.upper() == "SA" else "SST"
+    extra = "FREESTREAM_NU_FACTOR= 3.0\nSA_OPTIONS= NEGATIVE" if turb == "SA" else (
+        "TURBULENT_INTENSITY= 0.001\nTURBULENT_VISCOSITY_RATIO= 10.0"
+    )
+
+    return f"""% NASA CFDVAL2004 wall-mounted hump, baseline no-flow-control
+SOLVER= RANS
+MATH_PROBLEM= DIRECT
+RESTART_SOL= NO
+SYSTEM_MEASUREMENTS= SI
+KIND_TURB_MODEL= {turb}
+{extra}
+ITER= {iterations}
+CONV_FIELD= RMS_DENSITY
+CONV_RESIDUAL_MINVAL= -9
+CONV_STARTITER= 200
+CONV_CAUCHY_ELEMS= 200
+CONV_CAUCHY_EPS= 1E-8
+
+MACH_NUMBER= {MACH:.12g}
+AOA= 0.0
+INIT_OPTION= TD_CONDITIONS
+FREESTREAM_OPTION= TEMPERATURE_FS
+FREESTREAM_PRESSURE= {P_STATIC:.12g}
+FREESTREAM_TEMPERATURE= {T_STATIC:.12g}
+FREESTREAM_DENSITY= {rho:.15g}
+FREESTREAM_VELOCITY= ( {u:.15g}, 0.0, 0.0 )
+FREESTREAM_VISCOSITY= {mu:.15g}
+REYNOLDS_NUMBER= {RE_C:.15g}
+REYNOLDS_LENGTH= {CHORD_M:.15g}
+REF_DIMENSIONALIZATION= DIMENSIONAL
+FLUID_MODEL= STANDARD_AIR
+VISCOSITY_MODEL= CONSTANT_VISCOSITY
+MU_CONSTANT= {mu:.15g}
+CONDUCTIVITY_MODEL= CONSTANT_PRANDTL
+PRANDTL_LAM= 0.72
+PRANDTL_TURB= 0.90
+
+MARKER_HEATFLUX= ( wall, 0.0 )
+MARKER_EULER= ( upper )
+MARKER_RIEMANN= ( inlet, TOTAL_CONDITIONS_PT, {p0:.15g}, {t0:.15g}, 1.0, 0.0, 0.0, \\
+                  outlet, STATIC_PRESSURE, {P_STATIC:.15g}, 0.0, 0.0, 0.0, 0.0 )
+MARKER_PLOTTING= ( wall )
+MARKER_MONITORING= ( wall )
+MARKER_ANALYZE= ( inlet, outlet )
+MARKER_ANALYZE_AVERAGE= MASSFLUX
+
+REF_ORIGIN_MOMENT_X= 0.0
+REF_ORIGIN_MOMENT_Y= 0.0
+REF_ORIGIN_MOMENT_Z= 0.0
+REF_LENGTH= {CHORD_M:.15g}
+REF_AREA= {CHORD_M:.15g}
+
+NUM_METHOD_GRAD= WEIGHTED_LEAST_SQUARES
+CFL_NUMBER= {cfl:.12g}
+CFL_ADAPT= YES
+CFL_ADAPT_PARAM= ( 0.8, 1.05, 0.1, {cfl:.12g}, 1E-5 )
+MAX_DELTA_TIME= 1E6
+CONV_NUM_METHOD_FLOW= ROE
+ENTROPY_FIX_COEFF= 0.1
+MUSCL_FLOW= YES
+SLOPE_LIMITER_FLOW= VAN_ALBADA_EDGE
+TIME_DISCRE_FLOW= EULER_IMPLICIT
+CONV_NUM_METHOD_TURB= SCALAR_UPWIND
+MUSCL_TURB= NO
+SLOPE_LIMITER_TURB= VENKATAKRISHNAN
+TIME_DISCRE_TURB= EULER_IMPLICIT
+CFL_REDUCTION_TURB= 0.5
+LINEAR_SOLVER= FGMRES
+LINEAR_SOLVER_PREC= ILU
+LINEAR_SOLVER_ILU_FILL_IN= 0
+LINEAR_SOLVER_ERROR= 1E-4
+LINEAR_SOLVER_ITER= 20
+
+MESH_FILENAME= {mesh_name}
+MESH_FORMAT= SU2
+SOLUTION_FILENAME= solution_flow
+RESTART_FILENAME= restart_flow
+VOLUME_FILENAME= flow
+SURFACE_FILENAME= surface_flow
+CONV_FILENAME= history
+BREAKDOWN_FILENAME= forces_breakdown.dat
+TABULAR_FORMAT= CSV
+OUTPUT_PRECISION= 15
+SCREEN_OUTPUT= ( INNER_ITER, WALL_TIME, RMS_RES, LINSOL, MASSFLOW )
+HISTORY_OUTPUT= ( INNER_ITER, WALL_TIME, RMS_RES, FLOW_COEFF, MASSFLOW )
+VOLUME_OUTPUT= ( COORDINATES, SOLUTION, PRIMITIVE, MACH, VORTICITY, LAMINAR_VISCOSITY, EDDY_VISCOSITY, RESIDUALS )
+OUTPUT_FILES= ( RESTART, PARAVIEW, SURFACE_CSV )
+OUTPUT_WRT_FREQ= 500
+SCREEN_WRT_FREQ_INNER= 20
+HISTORY_WRT_FREQ_INNER= 1
+WRT_RESTART_OVERWRITE= YES
+WRT_SURFACE_OVERWRITE= YES
+WRT_VOLUME_OVERWRITE= YES
+WRT_FORCES_BREAKDOWN= YES
+"""
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mesh", required=True)
+    ap.add_argument("--model", choices=["SA", "SST"], required=True)
+    ap.add_argument("--iterations", type=int, default=12000)
+    ap.add_argument("--cfl", type=float, default=50.0)
+    ap.add_argument("--output", type=Path, required=True)
+    args = ap.parse_args()
+    args.output.write_text(config(args.mesh, args.model, args.iterations, args.cfl), encoding="utf-8")
+    print(args.output)
+
+
+if __name__ == "__main__":
+    main()
